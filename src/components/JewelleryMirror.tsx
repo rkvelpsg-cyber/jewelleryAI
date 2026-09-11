@@ -1,28 +1,37 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+import {
+  FaceLandmarker,
+  FilesetResolver,
+  PoseLandmarker,
+} from "@mediapipe/tasks-vision";
 import { Camera, CameraOff, RefreshCw } from "lucide-react";
-import type { ARTransform, JewelleryProduct } from "@/types";
+import type {
+  ARTransform,
+  JewelleryProduct,
+  JewelleryTransforms,
+} from "@/types";
+import {
+  computeJewelleryTransforms,
+  type Transform2D,
+} from "@/lib/vision/jewelleryPositioning";
 import ThreeJewelleryLayer from "./ThreeJewelleryLayer";
+import JewelleryCalibrationPanel from "./JewelleryCalibrationPanel";
 
 interface Props {
   product: JewelleryProduct;
   onSnapshot?: (dataUrl: string) => void;
 }
 
-type NormalizedLandmark = {
-  x: number;
-  y: number;
-  z?: number;
-  visibility?: number;
-  presence?: number;
-};
-
-const MODEL_URL =
+const FACE_MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const POSE_MODEL_URL =
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker_lite/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 const WASM_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
+
+const MIRROR_CAMERA = true;
 
 const initialTransform: ARTransform = {
   visible: false,
@@ -34,205 +43,257 @@ const initialTransform: ARTransform = {
   pitch: 0,
 };
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
+
 function smooth(oldValue: number, newValue: number, factor = 0.22) {
   return oldValue * (1 - factor) + newValue * factor;
 }
 
-function dist(a: NormalizedLandmark, b: NormalizedLandmark) {
-  return Math.hypot(a.x - b.x, a.y - b.y);
+function getDefaultCalibration(product: JewelleryProduct): Partial<JewelleryProduct> {
+  if (product.type === "earrings") {
+    return {
+      earringScaleMultiplier: product.earringScaleMultiplier ?? 0.16,
+      leftOffsetX: product.leftOffsetX ?? -0.02,
+      leftOffsetY: product.leftOffsetY ?? 0.04,
+      rightOffsetX: product.rightOffsetX ?? 0.02,
+      rightOffsetY: product.rightOffsetY ?? 0.04,
+      yawScaleStrength: product.yawScaleStrength ?? 0.2,
+      yawOpacityStrength: product.yawOpacityStrength ?? 0.5,
+    };
+  }
+
+  return {
+    scaleMultiplier: product.scaleMultiplier ?? 1.05,
+    offsetX: product.offsetX ?? 0,
+    offsetY: product.offsetY ?? 0,
+    verticalAnchorRatio: product.verticalAnchorRatio ?? 0.48,
+    rotationOffset: product.rotationOffset ?? 0,
+  };
 }
 
 export default function JewelleryMirror({ product, onSnapshot }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
-  const landmarkerRef = useRef<FaceLandmarker | null>(null);
+  const faceLandmarkerRef = useRef<FaceLandmarker | null>(null);
+  const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const frameRef = useRef<number | null>(null);
-  const lastVideoTimeRef = useRef(-1);
   const smoothRef = useRef<ARTransform>(initialTransform);
+  const previousTransformsRef = useRef<JewelleryTransforms>({});
+
   const [transform, setTransform] = useState<ARTransform>(initialTransform);
-  const [status, setStatus] = useState<"loading" | "ready" | "error">(
-    "loading",
-  );
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
   const [message, setMessage] = useState("Starting camera…");
+  const [showDebug, setShowDebug] = useState(false);
+  const [calibration, setCalibration] = useState<Partial<JewelleryProduct>>(() =>
+    getDefaultCalibration(product),
+  );
 
   const is3D = product.renderMode === "3d" && Boolean(product.model3dUrl);
+  const productConfig = useMemo(
+    () => ({ ...product, ...calibration }),
+    [product, calibration],
+  );
+
+  useEffect(() => {
+    setCalibration(getDefaultCalibration(product));
+    previousTransformsRef.current = {};
+    smoothRef.current = initialTransform;
+  }, [product]);
+
+  useEffect(() => {
+    if (!product.imageUrl) return;
+    const img = new Image();
+    img.src = product.imageUrl;
+    imageRef.current = img;
+  }, [product.imageUrl]);
 
   const stopAll = useCallback(() => {
     if (frameRef.current) cancelAnimationFrame(frameRef.current);
     frameRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
-    landmarkerRef.current?.close();
-    landmarkerRef.current = null;
+    faceLandmarkerRef.current?.close();
+    faceLandmarkerRef.current = null;
+    poseLandmarkerRef.current?.close();
+    poseLandmarkerRef.current = null;
   }, []);
 
-  const draw2D = useCallback(
-    (landmarks: NormalizedLandmark[]) => {
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      const img = imageRef.current;
-      if (!video || !canvas || !img || !img.complete) return;
+  const updateCalibration = useCallback((key: keyof JewelleryProduct, value: number) => {
+    setCalibration((previous) => ({ ...previous, [key]: value }));
+  }, []);
 
-      const rect = video.getBoundingClientRect();
-      if (
-        canvas.width !== Math.round(rect.width) ||
-        canvas.height !== Math.round(rect.height)
-      ) {
-        canvas.width = Math.round(rect.width);
-        canvas.height = Math.round(rect.height);
+  const resetCalibration = useCallback(() => {
+    setCalibration(getDefaultCalibration(product));
+  }, [product]);
+
+  const drawJewelleryImage = useCallback(
+    (ctx: CanvasRenderingContext2D, img: HTMLImageElement, item: Transform2D, flip = false) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const width = canvas.width * item.scale;
+      const aspect = img.naturalHeight / Math.max(img.naturalWidth, 1);
+      const height = width * aspect;
+      const x = item.x * canvas.width;
+      const y = item.y * canvas.height;
+
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(item.rotation);
+      ctx.globalAlpha = item.opacity;
+      if (flip) ctx.scale(-1, 1);
+      ctx.drawImage(img, -width / 2, -height * 0.28, width, height);
+      ctx.restore();
+    },
+    [],
+  );
+
+  const drawDebug = useCallback(
+    (ctx: CanvasRenderingContext2D, faceInfo: any, poseInfo: any) => {
+      if (!showDebug) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      if (faceInfo) {
+        const points = [
+          { x: faceInfo.chin.x, y: faceInfo.chin.y },
+          { x: faceInfo.leftFaceSide.x, y: faceInfo.leftFaceSide.y },
+          { x: faceInfo.rightFaceSide.x, y: faceInfo.rightFaceSide.y },
+        ];
+
+        ctx.fillStyle = "#00d1ff";
+        points.forEach((point) => {
+          const px = MIRROR_CAMERA ? (1 - point.x) * canvas.width : point.x * canvas.width;
+          const py = point.y * canvas.height;
+          ctx.beginPath();
+          ctx.arc(px, py, 4, 0, Math.PI * 2);
+          ctx.fill();
+        });
       }
 
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
+      if (poseInfo) {
+        const left = { x: poseInfo.leftShoulder.x, y: poseInfo.leftShoulder.y };
+        const right = { x: poseInfo.rightShoulder.x, y: poseInfo.rightShoulder.y };
+        const center = { x: poseInfo.shoulderCenterX, y: poseInfo.shoulderCenterY };
+
+        const leftPx = MIRROR_CAMERA ? (1 - left.x) * canvas.width : left.x * canvas.width;
+        const rightPx = MIRROR_CAMERA ? (1 - right.x) * canvas.width : right.x * canvas.width;
+        const centerPx = MIRROR_CAMERA ? (1 - center.x) * canvas.width : center.x * canvas.width;
+
+        ctx.strokeStyle = "#ffab40";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(leftPx, left.y * canvas.height);
+        ctx.lineTo(rightPx, right.y * canvas.height);
+        ctx.stroke();
+
+        ctx.fillStyle = "#ffd166";
+        [left, right, center].forEach((point, index) => {
+          const px = index === 0 ? leftPx : index === 1 ? rightPx : centerPx;
+          ctx.beginPath();
+          ctx.arc(px, point.y * canvas.height, 5, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+    },
+    [showDebug],
+  );
+
+  const renderLoop = useCallback(() => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const img = imageRef.current;
+    if (!video || !canvas || !img || !img.complete) {
+      frameRef.current = requestAnimationFrame(renderLoop);
+      return;
+    }
+
+    const rect = video.getBoundingClientRect();
+    if (canvas.width !== Math.round(rect.width) || canvas.height !== Math.round(rect.height)) {
+      canvas.width = Math.round(rect.width);
+      canvas.height = Math.round(rect.height);
+    }
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      frameRef.current = requestAnimationFrame(renderLoop);
+      return;
+    }
+
+    const faceTracker = faceLandmarkerRef.current;
+    const poseTracker = poseLandmarkerRef.current;
+
+    if (video.readyState >= 2 && faceTracker && poseTracker) {
+      const faceResult = faceTracker.detectForVideo(video, performance.now());
+      const poseResult = poseTracker.detectForVideo(video, performance.now());
+      const faceLandmarks = faceResult.faceLandmarks?.[0];
+      const poseLandmarks = poseResult.landmarks?.[0];
+      const faceInfo = faceLandmarks ? getFaceInfo(faceLandmarks) : null;
+      const poseInfo = poseLandmarks ? getPoseInfo(poseLandmarks) : null;
+      const transforms = computeJewelleryTransforms(
+        productConfig as any,
+        faceLandmarks,
+        poseLandmarks,
+        previousTransformsRef.current,
+      );
+      previousTransformsRef.current = transforms;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // MediaPipe is computed on the unmirrored video. The UI mirrors the video,
-      // so x is flipped when drawing overlays.
-      const leftSide = landmarks[127];
-      const rightSide = landmarks[356];
-      const chin = landmarks[152];
-      const nose = landmarks[1];
-      const forehead = landmarks[10];
-      if (!leftSide || !rightSide || !chin || !nose || !forehead) return;
-
-      const faceWidth = dist(leftSide, rightSide);
-      const faceAngle = Math.atan2(
-        rightSide.y - leftSide.y,
-        rightSide.x - leftSide.x,
-      );
-      const centerX = (leftSide.x + rightSide.x) / 2;
-      const centerY = (leftSide.y + rightSide.y) / 2;
-      const faceHeight = dist(forehead, chin);
-      const yaw = (nose.x - centerX) / Math.max(faceWidth, 0.001);
-      const pitch = (nose.y - centerY) / Math.max(faceHeight, 0.001);
-
-      let target: ARTransform;
-
       if (product.type === "earrings") {
-        target = {
-          visible: true,
-          x: centerX + product.offsetX * faceWidth,
-          y: centerY + product.offsetY * faceHeight,
-          scale: faceWidth * product.scaleMultiplier,
-          rotationZ: faceAngle,
-          yaw,
-          pitch,
-        };
-
-        const earringW = canvas.width * target.scale;
-        const earringH = earringW * 1.55;
-        const leftX =
-          (1 - rightSide.x) * canvas.width + product.offsetX * canvas.width;
-        const rightX =
-          (1 - leftSide.x) * canvas.width - product.offsetX * canvas.width;
-        const earY =
-          ((leftSide.y + rightSide.y) / 2 + 0.09 + product.offsetY * 0.2) *
-          canvas.height;
-
-        ctx.save();
-        ctx.globalAlpha = 0.98;
-        ctx.translate(leftX, earY);
-        ctx.rotate(-faceAngle);
-        ctx.drawImage(img, -earringW / 2, -earringH * 0.15, earringW, earringH);
-        ctx.restore();
-
-        ctx.save();
-        ctx.globalAlpha = 0.98;
-        ctx.translate(rightX, earY);
-        ctx.rotate(-faceAngle);
-        ctx.scale(-1, 1);
-        ctx.drawImage(img, -earringW / 2, -earringH * 0.15, earringW, earringH);
-        ctx.restore();
+        const leftTransform =
+          transforms.leftEarring ?? { x: 0.35, y: 0.35, scale: 0.14, rotation: 0, opacity: 1 };
+        const rightTransform =
+          transforms.rightEarring ?? { x: 0.65, y: 0.35, scale: 0.14, rotation: 0, opacity: 1 };
+        drawJewelleryImage(ctx, img, leftTransform, true);
+        drawJewelleryImage(ctx, img, rightTransform, false);
       } else {
-        target = {
+        const necklaceTransform =
+          transforms.necklace ?? { x: 0.5, y: 0.52, scale: 0.22, rotation: 0, opacity: 1 };
+        const nextAR: ARTransform = {
           visible: true,
-          x: centerX + product.offsetX * faceWidth,
-          y: chin.y + product.offsetY * faceHeight,
-          scale: faceWidth * product.scaleMultiplier,
-          rotationZ: faceAngle,
-          yaw,
-          pitch,
+          x: clamp(necklaceTransform.x, 0.08, 0.92),
+          y: clamp(necklaceTransform.y, 0.08, 0.92),
+          scale: clamp(necklaceTransform.scale, 0.08, 0.9),
+          rotationZ: clamp(necklaceTransform.rotation, -0.4, 0.4),
+          yaw: faceInfo?.yaw ?? 0,
+          pitch: 0,
         };
 
-        const previous = smoothRef.current;
-        const smoothed = {
+        smoothRef.current = {
           visible: true,
-          x: smooth(previous.x, target.x),
-          y: smooth(previous.y, target.y),
-          scale: smooth(previous.scale, target.scale),
-          rotationZ: smooth(previous.rotationZ, target.rotationZ),
-          yaw: smooth(previous.yaw, target.yaw),
-          pitch: smooth(previous.pitch, target.pitch),
+          x: smooth(smoothRef.current.x, nextAR.x, 0.2),
+          y: smooth(smoothRef.current.y, nextAR.y, 0.2),
+          scale: smooth(smoothRef.current.scale, nextAR.scale, 0.18),
+          rotationZ: smooth(smoothRef.current.rotationZ, nextAR.rotationZ, 0.12),
+          yaw: smooth(smoothRef.current.yaw, nextAR.yaw, 0.18),
+          pitch: smooth(smoothRef.current.pitch, nextAR.pitch, 0.18),
         };
-        smoothRef.current = smoothed;
-        setTransform(smoothed);
 
-        const w = canvas.width * smoothed.scale;
-        const aspect = img.naturalHeight / Math.max(img.naturalWidth, 1);
-        const h = w * aspect;
-        const x = (1 - smoothed.x) * canvas.width;
-        const y = smoothed.y * canvas.height;
-
-        ctx.save();
-        ctx.globalAlpha = 0.98;
-        ctx.translate(x, y);
-        ctx.rotate(-smoothed.rotationZ);
-        // Small horizontal perspective cue based on head yaw.
-        ctx.scale(Math.max(0.72, 1 - Math.abs(smoothed.yaw) * 0.6), 1);
-        ctx.drawImage(img, -w / 2, -h * 0.18, w, h);
-        ctx.restore();
+        setTransform(smoothRef.current);
+        drawJewelleryImage(ctx, img, {
+          x: smoothRef.current.x,
+          y: smoothRef.current.y,
+          scale: smoothRef.current.scale,
+          rotation: smoothRef.current.rotationZ,
+          opacity: 1,
+        }, false);
       }
-    },
-    [product],
-  );
 
-  const updateTransformOnly = useCallback(
-    (landmarks: NormalizedLandmark[]) => {
-      const leftSide = landmarks[127];
-      const rightSide = landmarks[356];
-      const chin = landmarks[152];
-      const nose = landmarks[1];
-      const forehead = landmarks[10];
-      if (!leftSide || !rightSide || !chin || !nose || !forehead) return;
+      drawDebug(ctx, faceInfo, poseInfo);
+    }
 
-      const faceWidth = dist(leftSide, rightSide);
-      const faceHeight = dist(forehead, chin);
-      const centerX = (leftSide.x + rightSide.x) / 2;
-      const centerY = (leftSide.y + rightSide.y) / 2;
-      const target: ARTransform = {
-        visible: true,
-        x: 1 - (centerX + product.offsetX * faceWidth),
-        y: chin.y + product.offsetY * faceHeight,
-        scale: faceWidth * product.scaleMultiplier,
-        rotationZ: -Math.atan2(
-          rightSide.y - leftSide.y,
-          rightSide.x - leftSide.x,
-        ),
-        yaw: (nose.x - centerX) / Math.max(faceWidth, 0.001),
-        pitch: (nose.y - centerY) / Math.max(faceHeight, 0.001),
-      };
-      const p = smoothRef.current;
-      const s = {
-        visible: true,
-        x: smooth(p.x, target.x),
-        y: smooth(p.y, target.y),
-        scale: smooth(p.scale, target.scale),
-        rotationZ: smooth(p.rotationZ, target.rotationZ),
-        yaw: smooth(p.yaw, target.yaw),
-        pitch: smooth(p.pitch, target.pitch),
-      };
-      smoothRef.current = s;
-      setTransform(s);
-    },
-    [product],
-  );
+    frameRef.current = requestAnimationFrame(renderLoop);
+  }, [drawDebug, drawJewelleryImage, product, productConfig, showDebug]);
 
-  const start = useCallback(async () => {
+  const startTracking = useCallback(async () => {
     stopAll();
     setStatus("loading");
     setMessage("Starting camera and face tracking…");
+
     try {
       const isSecureContext =
         window.isSecureContext ||
@@ -253,56 +314,25 @@ export default function JewelleryMirror({ product, onSnapshot }: Props) {
         );
       }
 
-      const devices = await navigator.mediaDevices
-        .enumerateDevices()
-        .catch(() => []);
-      const videoDevices = devices.filter(
-        (device) => device.kind === "videoinput",
-      );
-      const preferredDevice =
-        videoDevices.find((device) => /front|user|face/i.test(device.label)) ??
-        videoDevices[0];
-
-      if (!preferredDevice && videoDevices.length === 0) {
-        throw new DOMException(
-          "No camera devices were found on this machine.",
-          "NotFoundError",
-        );
-      }
-
-      const requestVideoConstraints: MediaTrackConstraints = {
-        facingMode: { ideal: "user" },
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-      };
-
-      if (preferredDevice) {
-        requestVideoConstraints.deviceId = { ideal: preferredDevice.deviceId };
-      }
-
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: requestVideoConstraints,
+        video: {
+          facingMode: { ideal: "user" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
       });
+
       streamRef.current = stream;
       if (!videoRef.current) return;
       videoRef.current.srcObject = stream;
       await videoRef.current.play();
 
-      let fileset: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
-      try {
-        fileset = await FilesetResolver.forVisionTasks(WASM_URL);
-      } catch {
-        throw new DOMException(
-          "Face tracking model failed to load. Check internet connection and try again.",
-          "NetworkError",
-        );
-      }
+      const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
 
-      let landmarker: FaceLandmarker;
       try {
-        landmarker = await FaceLandmarker.createFromOptions(fileset, {
-          baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+        faceLandmarkerRef.current = await FaceLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: FACE_MODEL_URL, delegate: "GPU" },
           runningMode: "VIDEO",
           numFaces: 1,
           minFaceDetectionConfidence: 0.5,
@@ -311,53 +341,40 @@ export default function JewelleryMirror({ product, onSnapshot }: Props) {
           outputFacialTransformationMatrixes: true,
         });
       } catch {
-        try {
-          landmarker = await FaceLandmarker.createFromOptions(fileset, {
-            baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
-            runningMode: "VIDEO",
-            numFaces: 1,
-            minFaceDetectionConfidence: 0.5,
-            minFacePresenceConfidence: 0.5,
-            minTrackingConfidence: 0.5,
-            outputFacialTransformationMatrixes: true,
-          });
-        } catch {
-          throw new DOMException(
-            "Face tracking could not initialize in this browser.",
-            "NotReadableError",
-          );
-        }
+        faceLandmarkerRef.current = await FaceLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: FACE_MODEL_URL, delegate: "CPU" },
+          runningMode: "VIDEO",
+          numFaces: 1,
+          minFaceDetectionConfidence: 0.5,
+          minFacePresenceConfidence: 0.5,
+          minTrackingConfidence: 0.5,
+          outputFacialTransformationMatrixes: true,
+        });
       }
-      landmarkerRef.current = landmarker;
+
+      try {
+        poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: POSE_MODEL_URL, delegate: "GPU" },
+          runningMode: "VIDEO",
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.3,
+          minPosePresenceConfidence: 0.3,
+          minTrackingConfidence: 0.3,
+        });
+      } catch {
+        poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: POSE_MODEL_URL, delegate: "CPU" },
+          runningMode: "VIDEO",
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.3,
+          minPosePresenceConfidence: 0.3,
+          minTrackingConfidence: 0.3,
+        });
+      }
+
       setStatus("ready");
       setMessage("Move naturally — the jewellery will follow you.");
-
-      const loop = () => {
-        const video = videoRef.current;
-        const tracker = landmarkerRef.current;
-        const canvas = canvasRef.current;
-        if (!video || !tracker || video.readyState < 2) {
-          frameRef.current = requestAnimationFrame(loop);
-          return;
-        }
-        if (video.currentTime !== lastVideoTimeRef.current) {
-          lastVideoTimeRef.current = video.currentTime;
-          const result = tracker.detectForVideo(video, performance.now());
-          const landmarks = result.faceLandmarks?.[0];
-          if (landmarks) {
-            if (is3D) updateTransformOnly(landmarks);
-            else draw2D(landmarks);
-          } else {
-            if (canvas)
-              canvas
-                .getContext("2d")
-                ?.clearRect(0, 0, canvas.width, canvas.height);
-            setTransform((t) => ({ ...t, visible: false }));
-          }
-        }
-        frameRef.current = requestAnimationFrame(loop);
-      };
-      loop();
+      frameRef.current = requestAnimationFrame(renderLoop);
     } catch (error) {
       console.error(error);
       let friendlyMessage =
@@ -376,86 +393,180 @@ export default function JewelleryMirror({ product, onSnapshot }: Props) {
         } else if (error.name === "OverconstrainedError") {
           friendlyMessage =
             "This camera configuration is not supported on this device. Please try again with the default camera settings.";
-        } else if (error.name === "NetworkError") {
-          friendlyMessage =
-            "The camera is available, but the face-tracking model could not load. Check your internet connection and try again.";
-        } else if (error.name === "NotReadableError") {
-          friendlyMessage =
-            "The camera is busy or the face-tracking engine could not start. Close other camera apps and retry.";
         }
       }
 
       setStatus("error");
       setMessage(friendlyMessage);
     }
-  }, [draw2D, is3D, stopAll, updateTransformOnly]);
+  }, [renderLoop, stopAll]);
 
   useEffect(() => {
-    const img = new Image();
-    img.src = product.imageUrl;
-    imageRef.current = img;
-    smoothRef.current = initialTransform;
-  }, [product]);
-
-  useEffect(() => {
-    start();
+    startTracking();
     return stopAll;
-  }, [start, stopAll]);
+  }, [startTracking, stopAll]);
 
   const capture = () => {
     const video = videoRef.current;
     const overlay = canvasRef.current;
     if (!video || !overlay) return;
+
     const rect = video.getBoundingClientRect();
-    const out = document.createElement("canvas");
-    out.width = Math.round(rect.width * 1.5);
-    out.height = Math.round(rect.height * 1.5);
-    const ctx = out.getContext("2d");
+    const output = document.createElement("canvas");
+    output.width = Math.round(rect.width * 1.5);
+    output.height = Math.round(rect.height * 1.5);
+
+    const ctx = output.getContext("2d");
     if (!ctx) return;
+
     ctx.save();
-    ctx.translate(out.width, 0);
+    ctx.translate(output.width, 0);
     ctx.scale(-1, 1);
-    ctx.drawImage(video, 0, 0, out.width, out.height);
+    ctx.drawImage(video, 0, 0, output.width, output.height);
     ctx.restore();
-    if (!is3D) ctx.drawImage(overlay, 0, 0, out.width, out.height);
-    const dataUrl = out.toDataURL("image/jpeg", 0.9);
-    onSnapshot?.(dataUrl);
+
+    if (!is3D) ctx.drawImage(overlay, 0, 0, output.width, output.height);
+    onSnapshot?.(output.toDataURL("image/jpeg", 0.9));
   };
 
   const statusClass = useMemo(() => `mirrorStatus ${status}`, [status]);
 
   return (
-    <div className="mirrorShell">
-      <div className="mirrorStage">
-        <video ref={videoRef} className="mirrorVideo" playsInline muted />
-        <canvas ref={canvasRef} className="mirrorCanvas" />
-        {is3D && (
-          <ThreeJewelleryLayer product={product} transform={transform} />
-        )}
-        <div className="cameraGuide" aria-hidden="true" />
-        <div className={statusClass}>
-          {status === "ready" ? (
-            <Camera size={17} />
-          ) : status === "error" ? (
-            <CameraOff size={17} />
-          ) : (
-            <RefreshCw size={17} className="spin" />
-          )}
-          <span>{message}</span>
+    <>
+      <div className="mirrorShell">
+        <div className="mirrorStage">
+          <video
+            ref={videoRef}
+            className="mirrorVideo"
+            playsInline
+            muted
+            style={{ transform: MIRROR_CAMERA ? "scaleX(-1)" : undefined }}
+          />
+          <canvas ref={canvasRef} className="mirrorCanvas" />
+          {is3D && <ThreeJewelleryLayer product={product} transform={transform} />}
+          <div className="cameraGuide" aria-hidden="true" />
+          <div className={statusClass}>
+            {status === "ready" ? (
+              <Camera size={17} />
+            ) : status === "error" ? (
+              <CameraOff size={17} />
+            ) : (
+              <RefreshCw size={17} className="spin" />
+            )}
+            <span>{message}</span>
+          </div>
+        </div>
+
+        <div className="mirrorActions">
+          <button className="secondaryButton" onClick={() => startTracking()}>
+            <RefreshCw size={19} /> Restart Camera
+          </button>
+          <button className="primaryButton" onClick={capture} disabled={status !== "ready"}>
+            <Camera size={19} /> Save This Look
+          </button>
         </div>
       </div>
-      <div className="mirrorActions">
-        <button className="secondaryButton" onClick={start}>
-          <RefreshCw size={19} /> Restart Camera
-        </button>
-        <button
-          className="primaryButton"
-          onClick={capture}
-          disabled={status !== "ready"}
+
+      {process.env.NODE_ENV === "development" ||
+      process.env.NEXT_PUBLIC_ENABLE_CALIBRATION === "true" ? (
+        <JewelleryCalibrationPanel
+          product={productConfig as JewelleryProduct}
+          calibration={calibration}
+          onChange={updateCalibration}
+          onReset={resetCalibration}
+        />
+      ) : null}
+
+      {process.env.NODE_ENV === "development" && (
+        <label
+          style={{
+            position: "fixed",
+            right: 16,
+            bottom: 120,
+            zIndex: 35,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "8px 10px",
+            borderRadius: 12,
+            background: "rgba(12,9,8,0.88)",
+            color: "#fff",
+            border: "1px solid rgba(255,255,255,0.12)",
+          }}
         >
-          <Camera size={19} /> Save This Look
-        </button>
-      </div>
-    </div>
+          <input type="checkbox" checked={showDebug} onChange={() => setShowDebug((value) => !value)} />
+          Show debug landmarks
+        </label>
+      )}
+    </>
   );
+}
+
+function getFaceInfo(faceLandmarks: any[]) {
+  if (!faceLandmarks || faceLandmarks.length < 10) return null;
+
+  const chin = faceLandmarks[152] ?? faceLandmarks[10] ?? faceLandmarks[0];
+  const nose = faceLandmarks[1] ?? faceLandmarks[0];
+  const forehead = faceLandmarks[10] ?? faceLandmarks[0];
+  const leftFaceSide =
+    faceLandmarks[234] ??
+    faceLandmarks[127] ??
+    faceLandmarks[93] ??
+    faceLandmarks[4] ??
+    faceLandmarks[0];
+  const rightFaceSide =
+    faceLandmarks[454] ??
+    faceLandmarks[356] ??
+    faceLandmarks[323] ??
+    faceLandmarks[14] ??
+    faceLandmarks[0];
+
+  if (!chin || !nose || !forehead || !leftFaceSide || !rightFaceSide) return null;
+
+  const faceWidth = Math.hypot(leftFaceSide.x - rightFaceSide.x, leftFaceSide.y - rightFaceSide.y);
+  const faceHeight = Math.hypot(forehead.x - chin.x, forehead.y - chin.y);
+  const centerX = (leftFaceSide.x + rightFaceSide.x) / 2;
+  const centerY = (leftFaceSide.y + rightFaceSide.y) / 2;
+  const yaw = (nose.x - centerX) / Math.max(faceWidth, 0.001);
+
+  return {
+    chin,
+    nose,
+    forehead,
+    leftFaceSide,
+    rightFaceSide,
+    centerX,
+    centerY,
+    faceWidth,
+    faceHeight,
+    yaw: clamp(yaw, -1, 1),
+  };
+}
+
+function getPoseInfo(poseLandmarks: any[]) {
+  if (!poseLandmarks || poseLandmarks.length < 12) return null;
+
+  const leftShoulder = poseLandmarks[11] ?? poseLandmarks[5];
+  const rightShoulder = poseLandmarks[12] ?? poseLandmarks[6];
+
+  if (!leftShoulder || !rightShoulder) return null;
+
+  const shoulderWidth = Math.hypot(
+    rightShoulder.x - leftShoulder.x,
+    rightShoulder.y - leftShoulder.y,
+  );
+
+  if (shoulderWidth < 0.02) return null;
+
+  const shoulderCenterX = (leftShoulder.x + rightShoulder.x) / 2;
+  const shoulderCenterY = (leftShoulder.y + rightShoulder.y) / 2;
+
+  return {
+    leftShoulder,
+    rightShoulder,
+    shoulderWidth,
+    shoulderCenterX,
+    shoulderCenterY,
+    yaw: 0,
+  };
 }

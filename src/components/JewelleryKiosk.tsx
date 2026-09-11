@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
 import { Gem, Heart, MessageCircle, QrCode, RotateCcw, Sparkles, X } from "lucide-react";
@@ -99,7 +99,7 @@ export default function JewelleryKiosk() {
               {categoryProducts.map((product) => (
                 <button key={product.id} className={selected.id === product.id ? "productCard active" : "productCard"} onClick={() => setSelectedId(product.id)}>
                   <div className="productThumb"><img src={product.imageUrl} alt="" /></div>
-                  <div className="productCardText"><strong>{product.name}</strong><span>{product.sku}</span><b>{formatCurrency(product.price)}</b></div>
+                  <div className="productCardText"><strong>{product.name}</strong><span>{product.sku}</span><b>{formatCurrency(product.price ?? 0)}</b></div>
                 </button>
               ))}
             </div>
@@ -114,7 +114,7 @@ export default function JewelleryKiosk() {
             <div className="detailType">{selected.type.toUpperCase()}</div>
             <h2>{selected.name}</h2>
             <div className="detailSku">SKU {selected.sku}</div>
-            <div className="price">{formatCurrency(selected.price)}</div>
+            <div className="price">{formatCurrency(selected.price ?? 0)}</div>
             <div className="specGrid">
               {selected.purity && <div><span>Purity</span><strong>{selected.purity}</strong></div>}
               {selected.weight && <div><span>Weight</span><strong>{selected.weight}</strong></div>}
