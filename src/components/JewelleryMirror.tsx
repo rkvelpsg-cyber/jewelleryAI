@@ -234,6 +234,18 @@ export default function JewelleryMirror({ product, onSnapshot }: Props) {
     setStatus("loading");
     setMessage("Starting camera and face tracking…");
     try {
+      const isSecureContext =
+        window.isSecureContext ||
+        location.hostname === "localhost" ||
+        location.hostname === "127.0.0.1";
+
+      if (!isSecureContext) {
+        throw new DOMException(
+          "Camera access requires HTTPS or localhost.",
+          "NotAllowedError",
+        );
+      }
+
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new DOMException(
           "Webcam access is not supported in this browser.",
@@ -258,27 +270,35 @@ export default function JewelleryMirror({ product, onSnapshot }: Props) {
         );
       }
 
-      const constraints: MediaTrackConstraints = {
+      const requestVideoConstraints: MediaTrackConstraints = {
+        facingMode: { ideal: "user" },
         width: { ideal: 1280 },
         height: { ideal: 720 },
       };
 
       if (preferredDevice) {
-        constraints.deviceId = { exact: preferredDevice.deviceId };
-      } else {
-        constraints.facingMode = "user";
+        requestVideoConstraints.deviceId = { ideal: preferredDevice.deviceId };
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: constraints,
+        video: requestVideoConstraints,
       });
       streamRef.current = stream;
       if (!videoRef.current) return;
       videoRef.current.srcObject = stream;
       await videoRef.current.play();
 
-      const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+      let fileset: Awaited<ReturnType<typeof FilesetResolver.forVisionTasks>>;
+      try {
+        fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+      } catch {
+        throw new DOMException(
+          "Face tracking model failed to load. Check internet connection and try again.",
+          "NetworkError",
+        );
+      }
+
       let landmarker: FaceLandmarker;
       try {
         landmarker = await FaceLandmarker.createFromOptions(fileset, {
@@ -291,16 +311,22 @@ export default function JewelleryMirror({ product, onSnapshot }: Props) {
           outputFacialTransformationMatrixes: true,
         });
       } catch {
-        // Some mini-PC/browser combinations do not support the GPU delegate.
-        landmarker = await FaceLandmarker.createFromOptions(fileset, {
-          baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
-          runningMode: "VIDEO",
-          numFaces: 1,
-          minFaceDetectionConfidence: 0.5,
-          minFacePresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5,
-          outputFacialTransformationMatrixes: true,
-        });
+        try {
+          landmarker = await FaceLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
+            runningMode: "VIDEO",
+            numFaces: 1,
+            minFaceDetectionConfidence: 0.5,
+            minFacePresenceConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+            outputFacialTransformationMatrixes: true,
+          });
+        } catch {
+          throw new DOMException(
+            "Face tracking could not initialize in this browser.",
+            "NotReadableError",
+          );
+        }
       }
       landmarkerRef.current = landmarker;
       setStatus("ready");
@@ -343,10 +369,19 @@ export default function JewelleryMirror({ product, onSnapshot }: Props) {
             "No camera was detected on this device. Please connect a webcam or use a different machine.";
         } else if (error.name === "NotAllowedError") {
           friendlyMessage =
-            "Camera access was blocked. Please allow webcam access and refresh the page.";
+            "Camera access was blocked or this page is not using HTTPS. Please allow webcam access and use a secure address.";
         } else if (error.name === "NotSupportedError") {
           friendlyMessage =
             "This browser does not support webcam access. Try Chrome or Edge.";
+        } else if (error.name === "OverconstrainedError") {
+          friendlyMessage =
+            "This camera configuration is not supported on this device. Please try again with the default camera settings.";
+        } else if (error.name === "NetworkError") {
+          friendlyMessage =
+            "The camera is available, but the face-tracking model could not load. Check your internet connection and try again.";
+        } else if (error.name === "NotReadableError") {
+          friendlyMessage =
+            "The camera is busy or the face-tracking engine could not start. Close other camera apps and retry.";
         }
       }
 
