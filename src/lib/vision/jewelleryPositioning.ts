@@ -1,5 +1,6 @@
 import { clamp, dist, type LandmarkLike } from "./faceTracking";
 import { getPoseInfo } from "./poseTracking";
+import { getFitProfile } from "./fitProfiles";
 
 export interface Transform2D {
   x: number;
@@ -23,6 +24,7 @@ export function computeJewelleryTransforms(
     offsetY?: number;
     verticalAnchorRatio?: number;
     rotationOffset?: number;
+    fitProfile?: Parameters<typeof getFitProfile>[0];
     earringScaleMultiplier?: number;
     leftOffsetX?: number;
     leftOffsetY?: number;
@@ -135,15 +137,18 @@ function buildNecklaceTransform(
     offsetY?: number;
     verticalAnchorRatio?: number;
     rotationOffset?: number;
+    fitProfile?: Parameters<typeof getFitProfile>[0];
   },
   faceInfo: ReturnType<typeof getFaceInfo>,
   poseInfo: ReturnType<typeof getPoseInfo>,
   previous: Transform2D,
 ): Transform2D {
-  const scaleMultiplier = product.scaleMultiplier ?? 1.05;
+  const profile = getFitProfile(product.fitProfile);
+  const scaleMultiplier = product.scaleMultiplier ?? profile.scaleMultiplier;
   const offsetX = product.offsetX ?? 0;
   const offsetY = product.offsetY ?? 0;
-  const verticalAnchorRatio = product.verticalAnchorRatio ?? 0.48;
+  const verticalAnchorRatio =
+    product.verticalAnchorRatio ?? profile.verticalAnchorRatio;
   const rotationOffset = product.rotationOffset ?? 0;
 
   let x = 0.5;
@@ -184,7 +189,7 @@ function buildNecklaceTransform(
   return {
     x: clamp(x, 0.1, 0.9),
     y: clamp(y, 0.1, 0.9),
-    scale: clamp(scale, 0.12, 0.9),
+    scale: clamp(scale, profile.minScale, profile.maxScale),
     rotation: clamp(rotation, -0.26, 0.26),
     opacity: 1,
   };
@@ -225,16 +230,8 @@ function buildEarringTransforms(
   const rightX = faceInfo.rightFaceSide.x + faceWidth * rightOffsetX;
   const rightY = faceInfo.rightFaceSide.y + faceWidth * rightOffsetY;
 
-  const leftYawFactor = clamp(
-    1 - Math.abs(faceInfo.yaw) * yawScaleStrength,
-    0.25,
-    1,
-  );
-  const rightYawFactor = clamp(
-    1 - Math.abs(faceInfo.yaw) * yawScaleStrength,
-    0.25,
-    1,
-  );
+  const leftYawFactor = clamp(1 + faceInfo.yaw * yawScaleStrength, 0.8, 1.08);
+  const rightYawFactor = clamp(1 - faceInfo.yaw * yawScaleStrength, 0.8, 1.08);
 
   const baseLeftScale = faceWidth * earringScaleMultiplier * leftYawFactor;
   const baseRightScale = faceWidth * earringScaleMultiplier * rightYawFactor;

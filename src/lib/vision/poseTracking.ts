@@ -15,6 +15,15 @@ export function getPoseInfo(landmarks: LandmarkLike[] | undefined) {
 
   if (shoulderWidth < 0.02) return null;
 
+  const confidence = Math.min(
+    leftShoulder.visibility ?? 1,
+    rightShoulder.visibility ?? 1,
+    leftShoulder.presence ?? 1,
+    rightShoulder.presence ?? 1,
+  );
+
+  if (confidence < 0.35) return null;
+
   const shoulderCenterX = (leftShoulder.x + rightShoulder.x) / 2;
   const shoulderCenterY = (leftShoulder.y + rightShoulder.y) / 2;
   const dx = rightShoulder.x - leftShoulder.x;
@@ -27,12 +36,7 @@ export function getPoseInfo(landmarks: LandmarkLike[] | undefined) {
     shoulderCenterX,
     shoulderCenterY,
     shoulderAngle: Math.atan2(dy, dx),
-    confidence: Math.min(
-      leftShoulder.visibility ?? 1,
-      rightShoulder.visibility ?? 1,
-      leftShoulder.presence ?? 1,
-      rightShoulder.presence ?? 1,
-    ),
+    confidence,
   };
 }
 

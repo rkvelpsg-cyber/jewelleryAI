@@ -1,13 +1,24 @@
 ﻿"use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Gem, Heart, MessageCircle, QrCode, RotateCcw, Sparkles, X } from "lucide-react";
+import {
+  Gem,
+  Heart,
+  MessageCircle,
+  QrCode,
+  RotateCcw,
+  Sparkles,
+  X,
+} from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { jewelleryProducts } from "@/data/jewellery";
 import { buildWhatsAppUrl, businessConfig, formatCurrency } from "@/lib/config";
 import type { JewelleryProduct, JewelleryType } from "@/types";
+import type { AssistantAction } from "@/types";
 import FullscreenButton from "./FullscreenButton";
 import JewelleryMirror from "./JewelleryMirror";
+import AIAssistantPanel from "./AIAssistantPanel";
+import { announceProduct } from "@/lib/assistant/interactionEngine";
 
 type Screen = "welcome" | "mirror";
 
@@ -15,6 +26,8 @@ const categories: { type: JewelleryType; label: string }[] = [
   { type: "necklace", label: "Necklaces" },
   { type: "choker", label: "Chokers" },
   { type: "earrings", label: "Earrings" },
+  { type: "bangles", label: "Bangles" },
+  { type: "rings", label: "Rings" },
 ];
 
 export default function JewelleryKiosk() {
@@ -25,11 +38,26 @@ export default function JewelleryKiosk() {
   const [snapshot, setSnapshot] = useState<string | null>(null);
   const [showShare, setShowShare] = useState(false);
 
-  const categoryProducts = useMemo(() => products.filter((p) => p.type === category), [category, products]);
-  const selected = products.find((p) => p.id === selectedId) || categoryProducts[0] || products[0];
+  const categoryProducts = useMemo(
+    () => products.filter((p) => p.type === category),
+    [category, products],
+  );
+  const selected =
+    products.find((p) => p.id === selectedId) ||
+    categoryProducts[0] ||
+    products[0];
 
   useEffect(() => {
-    if (!categoryProducts.some((p) => p.id === selectedId) && categoryProducts[0]) {
+    if (selected) announceProduct(selected);
+  }, [selected]);
+
+  useEffect(() => {
+    if (
+      !categoryProducts.some((p) => p.id === selectedId) &&
+      categoryProducts[0]
+    ) {
+      // Keep the selected product valid when changing catalogue categories.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedId(categoryProducts[0].id);
     }
   }, [category, categoryProducts, selectedId]);
@@ -37,31 +65,117 @@ export default function JewelleryKiosk() {
   useEffect(() => {
     if (screen !== "mirror") return;
     const reset = () => {
-      window.clearTimeout((window as unknown as { __lotusIdle?: number }).__lotusIdle);
-      (window as unknown as { __lotusIdle?: number }).__lotusIdle = window.setTimeout(() => {
-        setScreen("welcome");
-        setSnapshot(null);
-        setShowShare(false);
-      }, businessConfig.inactivitySeconds * 1000);
+      window.clearTimeout(
+        (window as unknown as { __lotusIdle?: number }).__lotusIdle,
+      );
+      (window as unknown as { __lotusIdle?: number }).__lotusIdle =
+        window.setTimeout(() => {
+          setScreen("welcome");
+          setSnapshot(null);
+          setShowShare(false);
+        }, businessConfig.inactivitySeconds * 1000);
     };
-    ["pointerdown", "mousemove", "keydown", "touchstart"].forEach((event) => window.addEventListener(event, reset, { passive: true }));
+    ["pointerdown", "mousemove", "keydown", "touchstart"].forEach((event) =>
+      window.addEventListener(event, reset, { passive: true }),
+    );
     reset();
     return () => {
-      ["pointerdown", "mousemove", "keydown", "touchstart"].forEach((event) => window.removeEventListener(event, reset));
-      window.clearTimeout((window as unknown as { __lotusIdle?: number }).__lotusIdle);
+      ["pointerdown", "mousemove", "keydown", "touchstart"].forEach((event) =>
+        window.removeEventListener(event, reset),
+      );
+      window.clearTimeout(
+        (window as unknown as { __lotusIdle?: number }).__lotusIdle,
+      );
     };
   }, [screen]);
 
   const start = () => setScreen("mirror");
-  const shareUrl = typeof window !== "undefined" ? window.location.href : "https://example.com";
+  const shareUrl =
+    typeof window !== "undefined"
+      ? window.location.href
+      : "https://example.com";
 
-  if (!selected) return <main className="app"><p>No active jewellery products found.</p></main>;
+  const handleAssistantAction = (action: AssistantAction) => {
+    if (
+      action.action === "NEXT_PRODUCT" ||
+      action.action === "PREVIOUS_PRODUCT"
+    ) {
+      const currentIndex = categoryProducts.findIndex(
+        (product) => product.id === selected.id,
+      );
+      const direction = action.action === "NEXT_PRODUCT" ? 1 : -1;
+      const nextIndex =
+        (currentIndex + direction + categoryProducts.length) %
+        categoryProducts.length;
+      const nextProduct = categoryProducts[nextIndex];
+      if (nextProduct) setSelectedId(nextProduct.id);
+      return;
+    }
+
+    if (action.action === "SAVE_LOOK" || action.action === "SEND_TO_PHONE") {
+      setShowShare(true);
+      return;
+    }
+
+    if (action.action === "FILTER_PRODUCTS") {
+      const filters = action.filters;
+      const requestedType = filters.type as JewelleryType | undefined;
+      if (requestedType) setCategory(requestedType);
+
+      const candidates = products.filter((product) => {
+        if (requestedType && product.type !== requestedType) return false;
+        if (
+          filters.maxPrice &&
+          (product.price ?? Infinity) > Number(filters.maxPrice)
+        )
+          return false;
+        if (
+          filters.category &&
+          !product.category
+            ?.toLowerCase()
+            .includes(String(filters.category).toLowerCase())
+        )
+          return false;
+        if (
+          filters.material &&
+          !product.material
+            ?.toLowerCase()
+            .includes(String(filters.material).toLowerCase())
+        )
+          return false;
+        if (filters.similarTo && product.type !== selected.type) return false;
+        return true;
+      });
+
+      const sorted = [...candidates].sort((left, right) => {
+        if (filters.sort === "weight-asc" || filters.sort === "weight-desc") {
+          const leftWeight = Number.parseFloat(left.weight ?? "999");
+          const rightWeight = Number.parseFloat(right.weight ?? "999");
+          return filters.sort === "weight-asc"
+            ? leftWeight - rightWeight
+            : rightWeight - leftWeight;
+        }
+        return (left.price ?? Infinity) - (right.price ?? Infinity);
+      });
+
+      if (sorted[0]) setSelectedId(sorted[0].id);
+    }
+  };
+
+  if (!selected)
+    return (
+      <main className="app">
+        <p>No active jewellery products found.</p>
+      </main>
+    );
 
   return (
     <main className="app">
       <header className="topbar">
         <div className="brandBlock">
-          <div className="lotusMark"><Gem size={22} /></div>
+          <div className="lotusMark">
+            <Gem size={22} />
+          </div>
           <div>
             <div className="brandName">LOTUS PRIME</div>
             <div className="brandSub">AI JEWELLERY MIRROR</div>
@@ -77,12 +191,25 @@ export default function JewelleryKiosk() {
         <section className="welcomeScreen">
           <div className="welcomeGlow" />
           <div className="welcomeCard">
-            <div className="eyebrow"><Sparkles size={16} /> LIVE VIRTUAL TRY-ON</div>
-            <h1>See the jewellery.<br /><span>See it on you.</span></h1>
-            <p>Try necklaces, chokers and earrings instantly using our live AI/AR mirror.</p>
-            <button className="heroButton" onClick={start}>Start Virtual Try-On <span>→</span></button>
+            <div className="eyebrow">
+              <Sparkles size={16} /> LIVE VIRTUAL TRY-ON
+            </div>
+            <h1>
+              See the jewellery.
+              <br />
+              <span>See it on you.</span>
+            </h1>
+            <p>
+              Try necklaces, chokers and earrings instantly using our live AI/AR
+              mirror.
+            </p>
+            <button className="heroButton" onClick={start}>
+              Start Virtual Try-On <span>→</span>
+            </button>
             <div className="welcomeFeatures">
-              <span>Live camera mirror</span><span>Instant switching</span><span>No app download</span>
+              <span>Live camera mirror</span>
+              <span>Instant switching</span>
+              <span>No app download</span>
             </div>
           </div>
         </section>
@@ -92,22 +219,61 @@ export default function JewelleryKiosk() {
             <div className="panelTitle">Choose Jewellery</div>
             <div className="categoryTabs">
               {categories.map((item) => (
-                <button key={item.type} className={category === item.type ? "categoryTab active" : "categoryTab"} onClick={() => setCategory(item.type)}>{item.label}</button>
+                <button
+                  key={item.type}
+                  className={
+                    category === item.type
+                      ? "categoryTab active"
+                      : "categoryTab"
+                  }
+                  onClick={() => setCategory(item.type)}
+                >
+                  {item.label}
+                </button>
               ))}
             </div>
             <div className="productList">
               {categoryProducts.map((product) => (
-                <button key={product.id} className={selected.id === product.id ? "productCard active" : "productCard"} onClick={() => setSelectedId(product.id)}>
-                  <div className="productThumb"><img src={product.imageUrl} alt="" /></div>
-                  <div className="productCardText"><strong>{product.name}</strong><span>{product.sku}</span><b>{formatCurrency(product.price ?? 0)}</b></div>
+                <button
+                  key={product.id}
+                  className={
+                    selected.id === product.id
+                      ? "productCard active"
+                      : "productCard"
+                  }
+                  onClick={() => setSelectedId(product.id)}
+                >
+                  <div className="productThumb">
+                    <img src={product.imageUrl} alt="" />
+                  </div>
+                  <div className="productCardText">
+                    <strong>{product.name}</strong>
+                    <span>{product.sku}</span>
+                    <b>{formatCurrency(product.price ?? 0)}</b>
+                  </div>
                 </button>
               ))}
             </div>
-            <button className="resetButton" onClick={() => setScreen("welcome")}><RotateCcw size={18} /> Start Again</button>
+            <button
+              className="resetButton"
+              onClick={() => setScreen("welcome")}
+            >
+              <RotateCcw size={18} /> Start Again
+            </button>
           </aside>
 
           <section className="mirrorPanel">
-            <JewelleryMirror product={selected} onSnapshot={(data) => { setSnapshot(data); setShowShare(true); }} />
+            <JewelleryMirror
+              product={selected}
+              onSnapshot={(data) => {
+                setSnapshot(data);
+                setShowShare(true);
+              }}
+            />
+            <AIAssistantPanel
+              currentProduct={selected}
+              onAction={handleAssistantAction}
+            />
           </section>
 
           <aside className="detailPanel">
@@ -116,13 +282,41 @@ export default function JewelleryKiosk() {
             <div className="detailSku">SKU {selected.sku}</div>
             <div className="price">{formatCurrency(selected.price ?? 0)}</div>
             <div className="specGrid">
-              {selected.purity && <div><span>Purity</span><strong>{selected.purity}</strong></div>}
-              {selected.weight && <div><span>Weight</span><strong>{selected.weight}</strong></div>}
+              {selected.purity && (
+                <div>
+                  <span>Purity</span>
+                  <strong>{selected.purity}</strong>
+                </div>
+              )}
+              {selected.weight && (
+                <div>
+                  <span>Weight</span>
+                  <strong>{selected.weight}</strong>
+                </div>
+              )}
             </div>
-            <div className="infoNote">Virtual preview for style visualization. Actual appearance and scale can vary slightly.</div>
-            <button className="whatsappButton" onClick={() => window.open(buildWhatsAppUrl(selected.name, selected.sku), "_blank", "noopener,noreferrer")}><MessageCircle size={20} /> WhatsApp Store</button>
-            <button className="shareButton" onClick={() => setShowShare(true)}><QrCode size={20} /> Scan / Save Look</button>
-            <div className="poweredBy"><Sparkles size={15} /> Powered by Lotus Prime Digital Solutions</div>
+            <div className="infoNote">
+              Virtual preview for style visualization. Actual appearance and
+              scale can vary slightly.
+            </div>
+            <button
+              className="whatsappButton"
+              onClick={() =>
+                window.open(
+                  buildWhatsAppUrl(selected.name, selected.sku),
+                  "_blank",
+                  "noopener,noreferrer",
+                )
+              }
+            >
+              <MessageCircle size={20} /> WhatsApp Store
+            </button>
+            <button className="shareButton" onClick={() => setShowShare(true)}>
+              <QrCode size={20} /> Scan / Save Look
+            </button>
+            <div className="poweredBy">
+              <Sparkles size={15} /> Powered by Lotus Prime Digital Solutions
+            </div>
           </aside>
         </section>
       )}
@@ -130,14 +324,44 @@ export default function JewelleryKiosk() {
       {showShare && (
         <div className="modalBackdrop" onClick={() => setShowShare(false)}>
           <div className="shareModal" onClick={(e) => e.stopPropagation()}>
-            <button className="modalClose" onClick={() => setShowShare(false)}><X /></button>
-            <div className="modalIcon"><Heart /></div>
+            <button className="modalClose" onClick={() => setShowShare(false)}>
+              <X />
+            </button>
+            <div className="modalIcon">
+              <Heart />
+            </div>
             <h3>Take this look with you</h3>
-            <p>{selected.name} · {selected.sku}</p>
-            {snapshot && <img className="snapshotPreview" src={snapshot} alt="Saved virtual jewellery look" />}
-            <div className="qrWrap"><QRCodeSVG value={shareUrl} size={150} bgColor="#fff" fgColor="#111" /></div>
+            <p>
+              {selected.name} · {selected.sku}
+            </p>
+            {snapshot && (
+              <img
+                className="snapshotPreview"
+                src={snapshot}
+                alt="Saved virtual jewellery look"
+              />
+            )}
+            <div className="qrWrap">
+              <QRCodeSVG
+                value={shareUrl}
+                size={150}
+                bgColor="#fff"
+                fgColor="#111"
+              />
+            </div>
             <small>Scan the QR code or send an enquiry on WhatsApp.</small>
-            <button className="whatsappButton wide" onClick={() => window.open(buildWhatsAppUrl(selected.name, selected.sku), "_blank", "noopener,noreferrer")}><MessageCircle size={20} /> Enquire on WhatsApp</button>
+            <button
+              className="whatsappButton wide"
+              onClick={() =>
+                window.open(
+                  buildWhatsAppUrl(selected.name, selected.sku),
+                  "_blank",
+                  "noopener,noreferrer",
+                )
+              }
+            >
+              <MessageCircle size={20} /> Enquire on WhatsApp
+            </button>
           </div>
         </div>
       )}

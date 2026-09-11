@@ -12,6 +12,8 @@ export function normalizedToCanvas(
   };
 }
 
+export const MIRROR_CAMERA = true;
+
 export function getVideoDisplayMetrics(
   videoWidth: number,
   videoHeight: number,
@@ -59,4 +61,22 @@ export function mapNormalizedToCanvas(
     offsetX,
     offsetY,
   };
+}
+
+export function mapVideoPointToCanvas(
+  x: number,
+  y: number,
+  video: Pick<HTMLVideoElement, "videoWidth" | "videoHeight">,
+  canvas: Pick<HTMLCanvasElement, "width" | "height">,
+  mirrored = MIRROR_CAMERA,
+) {
+  return mapNormalizedToCanvas(
+    x,
+    y,
+    video.videoWidth,
+    video.videoHeight,
+    canvas.width,
+    canvas.height,
+    mirrored,
+  );
 }
